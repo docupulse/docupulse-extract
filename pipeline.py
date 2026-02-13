@@ -1,7 +1,7 @@
 """
 Docling GPU Pipeline for DocuPulse
 
-Finds files needing Docling extraction, downloads from Azure Blob Storage,
+Finds files needing extraction, downloads from Azure Blob Storage,
 processes with GPU-accelerated Docling (OCR + table extraction), and writes
 results back to the file_extractions table.
 
@@ -9,13 +9,15 @@ Integrates directly with the main DocuPulse database schema:
   - files, folders, user_workspaces, file_extractions
 """
 
+import argparse
 import os
+import signal
 import sys
 import json
 import hashlib
 import logging
 import tempfile
-from datetime import datetime, timezone
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,28 +27,52 @@ from azure.storage.blob import BlobServiceClient
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractOcrOptions
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-DATABASE_URL = os.environ["DATABASE_URL"]
-AZURE_STORAGE_CONNECTION_STRING = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID")  # Optional: limit to one workspace
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    TesseractOcrOptions,
+    AcceleratorOptions,
 )
-log = logging.getLogger("docling-pipeline")
+
+__version__ = "1.0.0"
+
+# ─── Color helpers ────────────────────────────────────────────────────────────
+
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
+
+
+def _bold(t):   return _c("1", t)
+def _green(t):  return _c("32", t)
+def _red(t):    return _c("31", t)
+def _yellow(t): return _c("33", t)
+def _cyan(t):   return _c("36", t)
+def _dim(t):    return _c("2", t)
+
+# ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+_shutdown_requested = False
+
+
+def _request_shutdown(signum, _frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    name = signal.Signals(signum).name
+    print(f"\n  {_yellow('Received ' + name + ' — finishing current file, then stopping...')}")
+
+
+signal.signal(signal.SIGINT, _request_shutdown)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, _request_shutdown)
 
 # ─── SQL ──────────────────────────────────────────────────────────────────────
 
-# Find files that need Docling processing:
-#   - Have a file_extraction with strategy='docling' and status='PENDING'
-#   - OR have no docling extraction at all (auto-enqueue)
+# Find files that need processing:
+#   - Have a file_extraction with the given strategy and status='PENDING'
+#   - OR have no extraction row for that strategy yet (auto-enqueue)
+# When strategy is empty, match ALL strategies (no filter on strategy_name).
 FETCH_PENDING = """
     SELECT
         f.id                  AS file_id,
@@ -63,7 +89,7 @@ FETCH_PENDING = """
     FROM files f
     JOIN folders fo ON fo.id = f.folder_id
     LEFT JOIN file_extractions fe
-        ON fe.file_id = f.id AND fe.strategy_name = 'docling'
+        ON fe.file_id = f.id {strategy_join}
     WHERE (fe.id IS NULL OR fe.status = 'PENDING')
       {workspace_filter}
     ORDER BY f.created_at ASC
@@ -72,7 +98,7 @@ FETCH_PENDING = """
 
 INSERT_EXTRACTION = """
     INSERT INTO file_extractions (id, file_id, strategy_name, status, page_numbers, created_at, updated_at)
-    VALUES (%s, %s, 'docling', 'PENDING', '["all"]'::jsonb, NOW(), NOW())
+    VALUES (%s, %s, %s, 'PENDING', %s::jsonb, NOW(), NOW())
     RETURNING id;
 """
 
@@ -104,19 +130,23 @@ def generate_container_name(user_id: str, workspace_id: str) -> str:
 
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(os.environ["DATABASE_URL"], cursor_factory=RealDictCursor)
 
 
 def get_blob_service():
-    return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    return BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
 
 
-def create_converter():
+def create_converter(use_gpu: bool = True):
     """Create a Docling converter with OCR + table extraction enabled."""
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
     pipeline_options.do_table_structure = True
     pipeline_options.ocr_options = TesseractOcrOptions()
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=4,
+        device="cuda" if use_gpu else "cpu",
+    )
 
     return DocumentConverter(
         allowed_formats=[
@@ -141,175 +171,34 @@ def download_blob(blob_service, container_name, blob_name, local_path):
         stream.readinto(f)
 
 
-# ─── Main pipeline ───────────────────────────────────────────────────────────
+def trim_pdf_pages(input_path: str, max_pages: int) -> str:
+    """Trim a PDF to the first max_pages pages. Returns path to trimmed file."""
+    from pypdf import PdfReader, PdfWriter
 
-def run_pipeline():
-    log.info("=" * 60)
-    log.info("Docling GPU Pipeline — Starting")
-    log.info("=" * 60)
+    reader = PdfReader(input_path)
+    if len(reader.pages) <= max_pages:
+        return input_path  # No trimming needed
 
-    conn = get_db()
-    blob_service = get_blob_service()
-    converter = create_converter()
+    writer = PdfWriter()
+    for i in range(min(max_pages, len(reader.pages))):
+        writer.add_page(reader.pages[i])
 
-    # Build query with optional workspace filter
-    workspace_filter = ""
-    query_params = [BATCH_SIZE]
-    if WORKSPACE_ID:
-        workspace_filter = "AND fo.workspace_id = %s"
-        query_params = [WORKSPACE_ID, BATCH_SIZE]
-        log.info(f"Filtering to workspace: {WORKSPACE_ID}")
+    trimmed_path = input_path + ".trimmed.pdf"
+    with open(trimmed_path, "wb") as f:
+        writer.write(f)
+    return trimmed_path
 
-    query = FETCH_PENDING.format(workspace_filter=workspace_filter)
-    # Fix param order: workspace_id before batch_size (LIMIT is last)
-    if WORKSPACE_ID:
-        final_params = (WORKSPACE_ID, BATCH_SIZE)
-    else:
-        final_params = (BATCH_SIZE,)
 
-    with conn.cursor() as cur:
-        cur.execute(query, final_params)
-        jobs = cur.fetchall()
-
-    if not jobs:
-        log.info("No files to process. Exiting.")
-        conn.close()
-        return
-
-    log.info(f"Found {len(jobs)} file(s) to process.")
-
-    succeeded = 0
-    failed = 0
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for job in jobs:
-            file_id = job["file_id"]
-            blob_name = job["download_blob_name"]
-            user_id = job["user_id"]
-            workspace_id = str(job["workspace_id"])
-            extraction_id = job["extraction_id"]
-
-            # If no user found for workspace, skip
-            if not user_id:
-                log.error(f"[{file_id}] No user found for workspace {workspace_id}. Skipping.")
-                if extraction_id:
-                    with conn.cursor() as cur:
-                        cur.execute(MARK_FAILED, (
-                            json.dumps({"error": "No user found for workspace"}),
-                            extraction_id,
-                        ))
-                    conn.commit()
-                failed += 1
-                continue
-
-            # Auto-create extraction record if it doesn't exist
-            if extraction_id is None:
-                new_id = str(uuid4())
-                with conn.cursor() as cur:
-                    cur.execute(INSERT_EXTRACTION, (new_id, file_id))
-                    extraction_id = cur.fetchone()["id"]
-                conn.commit()
-                log.info(f"[{file_id}] Created extraction record {extraction_id}")
-
-            container_name = generate_container_name(user_id, workspace_id)
-            file_ext = Path(blob_name).suffix or ".pdf"
-            local_file = Path(tmpdir) / f"{file_id}{file_ext}"
-
-            try:
-                # Download
-                log.info(f"[{extraction_id}] Downloading {container_name}/{blob_name}...")
-                download_blob(blob_service, container_name, blob_name, str(local_file))
-                file_size = local_file.stat().st_size
-                log.info(f"[{extraction_id}] Downloaded {file_size:,} bytes")
-
-                # Convert with Docling
-                log.info(f"[{extraction_id}] Processing with Docling...")
-                result = converter.convert(str(local_file))
-
-                markdown = result.document.export_to_markdown()
-                text = (
-                    result.document.export_to_text()
-                    if hasattr(result.document, "export_to_text")
-                    else ""
-                )
-
-                num_pages = (
-                    len(result.document.pages)
-                    if hasattr(result.document, "pages")
-                    else None
-                )
-                num_tables = (
-                    len(result.document.tables)
-                    if hasattr(result.document, "tables")
-                    else 0
-                )
-
-                # Build page-level lines for compatibility with existing chunking
-                pages = []
-                if text:
-                    for i, page_text in enumerate(_split_by_pages(text, num_pages), start=1):
-                        lines = [
-                            {"content": line, "polygon": None}
-                            for line in page_text.split("\n")
-                            if line.strip()
-                        ]
-                        if lines:
-                            pages.append({"page_number": i, "lines": lines})
-
-                raw_data = {
-                    "pages": pages,
-                    "content_markdown": markdown,
-                    "content_text": text,
-                    "num_pages": num_pages,
-                    "num_tables": num_tables,
-                    "page_numbers": ["all"],
-                    "extraction_model": "docling",
-                    "extraction_id": str(extraction_id),
-                }
-
-                metadata = {
-                    "extraction_model": "docling",
-                    "processing_method": "docling_gpu",
-                    "ocr_used": True,
-                    "gpu_accelerated": True,
-                    "content_length": len(markdown),
-                    "num_pages": num_pages,
-                    "num_tables": num_tables,
-                }
-
-                with conn.cursor() as cur:
-                    cur.execute(SAVE_RESULT, (
-                        json.dumps(raw_data),
-                        json.dumps(metadata),
-                        extraction_id,
-                    ))
-                conn.commit()
-
-                succeeded += 1
-                log.info(f"[{extraction_id}] Done — {len(markdown):,} chars, {num_pages} pages, {num_tables} tables")
-
-            except Exception as e:
-                log.error(f"[{extraction_id}] FAILED: {e}", exc_info=True)
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(MARK_FAILED, (
-                            json.dumps({"error": str(e)[:2000]}),
-                            extraction_id,
-                        ))
-                    conn.commit()
-                except Exception:
-                    log.error(f"[{extraction_id}] Could not mark as failed in DB", exc_info=True)
-                failed += 1
-            finally:
-                # Clean up downloaded file to save disk on large batches
-                if local_file.exists():
-                    local_file.unlink()
-
-    log.info("=" * 60)
-    log.info(f"Pipeline complete: {succeeded} succeeded, {failed} failed out of {len(jobs)}")
-    log.info("=" * 60)
-
-    conn.close()
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {secs:.0f}s"
+    hours = int(minutes // 60)
+    mins = minutes % 60
+    return f"{hours}h {mins}m"
 
 
 def _split_by_pages(text: str, num_pages: int | None) -> list[str]:
@@ -323,5 +212,325 @@ def _split_by_pages(text: str, num_pages: int | None) -> list[str]:
     return [text]
 
 
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="pipeline",
+        description="DocuPulse Docling GPU Pipeline — batch document extraction",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--batch-size", "-b", type=int,
+        default=int(os.environ.get("BATCH_SIZE", "50")),
+        help="Max files per run (default: $BATCH_SIZE or 50)",
+    )
+    parser.add_argument(
+        "--strategy", "-s", type=str,
+        default=os.environ.get("STRATEGY_NAME", "docling"),
+        help='Strategy name filter (default: $STRATEGY_NAME or "docling"). '
+             'Use --strategy "" to fetch all pending extractions.',
+    )
+    parser.add_argument(
+        "--max-pages", "-p", type=int,
+        default=int(os.environ.get("MAX_PAGES", "0")),
+        help="Extract only first N pages from PDFs (default: $MAX_PAGES or 0 = all)",
+    )
+    parser.add_argument(
+        "--workspace", "-w", type=str,
+        default=os.environ.get("WORKSPACE_ID", ""),
+        help="Limit to a specific workspace UUID (default: $WORKSPACE_ID or all)",
+    )
+    gpu_default = os.environ.get("USE_GPU", "true").lower() in ("true", "1", "yes")
+    parser.add_argument(
+        "--gpu", dest="use_gpu",
+        action=argparse.BooleanOptionalAction,
+        default=gpu_default,
+        help="Enable/disable GPU acceleration (default: $USE_GPU or true)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be processed, then exit without running",
+    )
+    parser.add_argument(
+        "--log-level", type=str,
+        default=os.environ.get("LOG_LEVEL", "INFO"),
+        help="Log level (default: $LOG_LEVEL or INFO)",
+    )
+    return parser.parse_args(argv)
+
+
+# ─── Main pipeline ───────────────────────────────────────────────────────────
+
+def run_pipeline(args):
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger("docling-pipeline")
+
+    strategy = args.strategy
+    batch_size = args.batch_size
+    max_pages = args.max_pages
+    use_gpu = args.use_gpu
+    workspace_id = args.workspace or None
+
+    # ── Banner ──
+    accel_label = _green("GPU (CUDA)") if use_gpu else _yellow("CPU")
+    print()
+    print(_bold("=" * 58))
+    print(_bold(f"  DocuPulse Docling Pipeline  v{__version__}"))
+    print(_bold("=" * 58))
+    print()
+    print(f"  Accelerator:   {accel_label}")
+    print(f"  Batch size:    {_bold(str(batch_size))}")
+    print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
+    print(f"  Max pages:     {_bold(str(max_pages) if max_pages > 0 else '0 (all pages)')}")
+    print(f"  Workspace:     {_bold(workspace_id if workspace_id else '(all workspaces)')}")
+    if args.dry_run:
+        print(f"  Mode:          {_yellow('DRY RUN')}")
+    print()
+
+    conn = get_db()
+
+    # ── Build query ──
+    query_params = []
+
+    if strategy:
+        strategy_join = "AND fe.strategy_name = %s"
+        query_params.append(strategy)
+    else:
+        strategy_join = ""
+
+    if workspace_id:
+        workspace_filter = "AND fo.workspace_id = %s"
+        query_params.append(workspace_id)
+    else:
+        workspace_filter = ""
+
+    query_params.append(batch_size)
+
+    query = FETCH_PENDING.format(
+        strategy_join=strategy_join,
+        workspace_filter=workspace_filter,
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(query, tuple(query_params))
+        jobs = cur.fetchall()
+
+    if not jobs:
+        print(_dim("  No files to process. Exiting."))
+        print()
+        conn.close()
+        return
+
+    print(f"  Found {_bold(str(len(jobs)))} file(s) to process.")
+    print()
+
+    # ── Dry run ──
+    if args.dry_run:
+        print(_yellow("  DRY RUN — files that would be processed:"))
+        print()
+        for i, job in enumerate(jobs, 1):
+            eid = job["extraction_id"] or "(new)"
+            print(f"  {i:>3}.  file={job['file_id']}  blob={job['download_blob_name']}  extraction={eid}")
+        print()
+        print(_dim(f"  {len(jobs)} file(s) would be processed. Exiting."))
+        print()
+        conn.close()
+        return
+
+    # ── Process ──
+    blob_service = get_blob_service()
+    converter = create_converter(use_gpu=use_gpu)
+
+    page_numbers_json = json.dumps(list(range(1, max_pages + 1))) if max_pages > 0 else '["all"]'
+
+    succeeded = []
+    failed = []
+    skipped = []
+    total_start = time.monotonic()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, job in enumerate(jobs, 1):
+            # Check for graceful shutdown between files
+            if _shutdown_requested:
+                remaining = len(jobs) - idx + 1
+                print(f"\n  {_yellow('Shutdown requested.')} Stopping with {remaining} file(s) remaining.")
+                print(f"  {_dim('Remaining files stay PENDING and will be picked up on next run.')}")
+                break
+
+            file_id = job["file_id"]
+            blob_name = job["download_blob_name"]
+            user_id = job["user_id"]
+            workspace_id_job = str(job["workspace_id"])
+            extraction_id = job["extraction_id"]
+
+            prefix = f"[{idx}/{len(jobs)}]"
+            file_start = time.monotonic()
+
+            # If no user found for workspace, skip
+            if not user_id:
+                log.error(f"{prefix} No user found for workspace {workspace_id_job}. Skipping.")
+                if extraction_id:
+                    with conn.cursor() as cur:
+                        cur.execute(MARK_FAILED, (
+                            json.dumps({"error": "No user found for workspace"}),
+                            extraction_id,
+                        ))
+                    conn.commit()
+                skipped.append(file_id)
+                continue
+
+            # Auto-create extraction record if it doesn't exist
+            if extraction_id is None:
+                new_id = str(uuid4())
+                with conn.cursor() as cur:
+                    cur.execute(INSERT_EXTRACTION, (new_id, file_id, strategy or "docling", page_numbers_json))
+                    extraction_id = cur.fetchone()["id"]
+                conn.commit()
+                log.info(f"{prefix} Created extraction record {extraction_id}")
+
+            container_name = generate_container_name(user_id, workspace_id_job)
+            file_ext = Path(blob_name).suffix or ".pdf"
+            local_file = Path(tmpdir) / f"{file_id}{file_ext}"
+
+            try:
+                # Download
+                print(f"  {prefix} {_cyan('Downloading')} {container_name}/{blob_name}...")
+                download_blob(blob_service, container_name, blob_name, str(local_file))
+                file_size = local_file.stat().st_size
+                log.info(f"{prefix} Downloaded {file_size:,} bytes")
+
+                # Trim PDF if max_pages is set
+                convert_path = str(local_file)
+                if max_pages > 0 and file_ext.lower() == ".pdf":
+                    log.info(f"{prefix} Trimming PDF to first {max_pages} page(s)...")
+                    convert_path = trim_pdf_pages(str(local_file), max_pages)
+
+                # Convert with Docling
+                print(f"  {prefix} {_cyan('Processing')} with Docling...")
+                result = converter.convert(convert_path)
+
+                markdown = result.document.export_to_markdown()
+                text = (
+                    result.document.export_to_text()
+                    if hasattr(result.document, "export_to_text")
+                    else ""
+                )
+
+                num_pages_found = (
+                    len(result.document.pages)
+                    if hasattr(result.document, "pages")
+                    else None
+                )
+                num_tables = (
+                    len(result.document.tables)
+                    if hasattr(result.document, "tables")
+                    else 0
+                )
+
+                # Build page-level lines for compatibility with existing chunking
+                pages = []
+                if text:
+                    for i, page_text in enumerate(_split_by_pages(text, num_pages_found), start=1):
+                        lines = [
+                            {"content": line, "polygon": None}
+                            for line in page_text.split("\n")
+                            if line.strip()
+                        ]
+                        if lines:
+                            pages.append({"page_number": i, "lines": lines})
+
+                actual_page_numbers = list(range(1, max_pages + 1)) if max_pages > 0 else ["all"]
+
+                raw_data = {
+                    "pages": pages,
+                    "content_markdown": markdown,
+                    "content_text": text,
+                    "num_pages": num_pages_found,
+                    "num_tables": num_tables,
+                    "page_numbers": actual_page_numbers,
+                    "extraction_model": strategy or "docling",
+                    "extraction_id": str(extraction_id),
+                }
+
+                metadata = {
+                    "extraction_model": strategy or "docling",
+                    "processing_method": "docling_gpu" if use_gpu else "docling_cpu",
+                    "ocr_used": True,
+                    "gpu_accelerated": use_gpu,
+                    "content_length": len(markdown),
+                    "num_pages": num_pages_found,
+                    "num_tables": num_tables,
+                    "max_pages_setting": max_pages,
+                }
+
+                with conn.cursor() as cur:
+                    cur.execute(SAVE_RESULT, (
+                        json.dumps(raw_data),
+                        json.dumps(metadata),
+                        extraction_id,
+                    ))
+                conn.commit()
+
+                elapsed = time.monotonic() - file_start
+                succeeded.append(file_id)
+                print(f"  {prefix} {_green('Done')} — {len(markdown):,} chars, {num_pages_found} pages, {num_tables} tables ({format_duration(elapsed)})")
+
+            except Exception as e:
+                elapsed = time.monotonic() - file_start
+                log.error(f"{prefix} FAILED: {e}", exc_info=True)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(MARK_FAILED, (
+                            json.dumps({"error": str(e)[:2000]}),
+                            extraction_id,
+                        ))
+                    conn.commit()
+                except Exception:
+                    log.error(f"{prefix} Could not mark as failed in DB", exc_info=True)
+                failed.append(file_id)
+            finally:
+                # Clean up downloaded file to save disk on large batches
+                if local_file.exists():
+                    local_file.unlink()
+                # Clean up trimmed file too
+                trimmed = Path(str(local_file) + ".trimmed.pdf")
+                if trimmed.exists():
+                    trimmed.unlink()
+
+    total_elapsed = time.monotonic() - total_start
+
+    # ── Summary ──
+    print()
+    print(_bold("=" * 58))
+    print(_bold("  Summary"))
+    print(_bold("=" * 58))
+    print(f"  {_green('Succeeded:')}  {len(succeeded)}")
+    print(f"  {_red('Failed:')}     {len(failed)}")
+    print(f"  {_yellow('Skipped:')}    {len(skipped)}")
+    print(f"  {_dim('Total time:')} {format_duration(total_elapsed)}")
+    print()
+
+    if failed:
+        print(_red("  Failed files:"))
+        for fid in failed:
+            print(f"    - {fid}")
+        print()
+
+    if skipped:
+        print(_yellow("  Skipped files:"))
+        for fid in skipped:
+            print(f"    - {fid}")
+        print()
+
+    conn.close()
+
+
 if __name__ == "__main__":
-    run_pipeline()
+    run_pipeline(parse_args())

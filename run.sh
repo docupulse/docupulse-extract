@@ -79,6 +79,9 @@ az container create \
         BATCH_SIZE="$BATCH_SIZE" \
         WORKSPACE_ID="${WORKSPACE_ID:-}" \
         LOG_LEVEL="${LOG_LEVEL:-INFO}" \
+        STRATEGY_NAME="${STRATEGY_NAME:-docling}" \
+        MAX_PAGES="${MAX_PAGES:-0}" \
+        USE_GPU="${USE_GPU:-true}" \
     --registry-login-server "${ACR_NAME}.azurecr.io" \
     --registry-username "$ACR_USER" \
     --registry-password "$ACR_PASS" \
