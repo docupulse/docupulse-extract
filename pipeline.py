@@ -94,7 +94,7 @@ FETCH_PENDING = """
     JOIN folders fo ON fo.id = f.folder_id
     LEFT JOIN file_extractions fe
         ON fe.file_id = f.id
-    WHERE (fe.id IS NULL OR fe.status = %s)
+    WHERE f.status = %s
       {workspace_filter}
     ORDER BY f.created_at ASC
     LIMIT %s;
