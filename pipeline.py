@@ -94,7 +94,7 @@ FETCH_PENDING = """
     JOIN folders fo ON fo.id = f.folder_id
     LEFT JOIN file_extractions fe
         ON fe.file_id = f.id {strategy_join}
-    WHERE (fe.id IS NULL OR fe.status = 'PENDING')
+    WHERE (fe.id IS NULL OR fe.status = %s)
       {workspace_filter}
     ORDER BY f.created_at ASC
     LIMIT %s;
@@ -102,16 +102,23 @@ FETCH_PENDING = """
 
 INSERT_EXTRACTION = """
     INSERT INTO file_extractions (id, file_id, strategy_name, status, page_numbers, created_at, updated_at)
-    VALUES (%s, %s, %s, 'PENDING', %s::jsonb, NOW(), NOW())
+    VALUES (%s, %s, %s, %s, %s::jsonb, NOW(), NOW())
     RETURNING id;
 """
 
 SAVE_RESULT = """
     UPDATE file_extractions
-    SET status              = 'EXTRACTED',
+    SET status              = %s,
         raw_extracted_data  = %s::jsonb,
         extraction_metadata = %s::jsonb,
         updated_at          = NOW()
+    WHERE id = %s;
+"""
+
+UPDATE_FILE_STATUS = """
+    UPDATE files
+    SET status     = %s,
+        updated_at = NOW()
     WHERE id = %s;
 """
 
@@ -271,6 +278,16 @@ def parse_args(argv=None):
         help="Extract only first N pages from PDFs (default: $MAX_PAGES or 0 = all)",
     )
     parser.add_argument(
+        "--source-status", type=str,
+        default=os.environ.get("SOURCE_STATUS", "PENDING"),
+        help='Pick up files with this status (default: $SOURCE_STATUS or "PENDING")',
+    )
+    parser.add_argument(
+        "--completion-status", type=str,
+        default=os.environ.get("COMPLETION_STATUS", "EXTRACTED"),
+        help='Status to set after extraction (default: $COMPLETION_STATUS or "EXTRACTED")',
+    )
+    parser.add_argument(
         "--workspace", "-w", type=str,
         default=os.environ.get("WORKSPACE_ID", ""),
         help="Limit to a specific workspace UUID (default: $WORKSPACE_ID or all)",
@@ -324,6 +341,8 @@ def run_pipeline(args):
     max_pages = args.max_pages
     use_gpu = args.use_gpu
     workspace_id = args.workspace or None
+    source_status = args.source_status
+    completion_status = args.completion_status
 
     # ── Banner ──
     accel_label = _green("GPU (CUDA)") if use_gpu else _yellow("CPU")
@@ -336,16 +355,24 @@ def run_pipeline(args):
     print(f"  Batch size:    {_bold(str(batch_size))}")
     print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
     print(f"  Max pages:     {_bold(str(max_pages) if max_pages > 0 else '0 (all pages)')}")
+    print(f"  Source status:  {_bold(source_status)}")
+    print(f"  Target status:  {_bold(completion_status)}")
     print(f"  Workspace:     {_bold(workspace_id if workspace_id else '(all workspaces)')}")
     print(f"  GPU batching:  {_dim(f'ocr={args.ocr_batch}  layout={args.layout_batch}  table={args.table_batch}')}")
     if args.dry_run:
         print(f"  Mode:          {_yellow('DRY RUN')}")
     print()
 
+    confirm = input(f"  {_bold('Continue? [y/N]')} ").strip().lower()
+    if confirm != "y":
+        print(_dim("  Aborted."))
+        print()
+        return
+
     conn = get_db()
 
     # ── Build query ──
-    query_params = []
+    query_params = [source_status]
 
     if strategy:
         strategy_join = "AND fe.strategy_name = %s"
@@ -443,7 +470,7 @@ def run_pipeline(args):
             if extraction_id is None:
                 new_id = str(uuid4())
                 with conn.cursor() as cur:
-                    cur.execute(INSERT_EXTRACTION, (new_id, file_id, strategy or "docling", page_numbers_json))
+                    cur.execute(INSERT_EXTRACTION, (new_id, file_id, strategy or "docling", completion_status, page_numbers_json))
                     extraction_id = cur.fetchone()["id"]
                 conn.commit()
                 log.info(f"{prefix} Created extraction record {extraction_id}")
@@ -525,10 +552,12 @@ def run_pipeline(args):
 
                 with conn.cursor() as cur:
                     cur.execute(SAVE_RESULT, (
+                        completion_status,
                         json.dumps(raw_data),
                         json.dumps(metadata),
                         extraction_id,
                     ))
+                    cur.execute(UPDATE_FILE_STATUS, (completion_status, file_id))
                 conn.commit()
 
                 elapsed = time.monotonic() - file_start
