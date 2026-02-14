@@ -578,7 +578,7 @@ def run_pipeline(args):
 
             except Exception as e:
                 elapsed = time.monotonic() - file_start
-                log.error(f"{prefix} FAILED: {e}", exc_info=True)
+                print(f"  {prefix} {_red('FAILED')} — {e}")
                 try:
                     with conn.cursor() as cur:
                         cur.execute(MARK_FAILED, (
