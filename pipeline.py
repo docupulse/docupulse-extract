@@ -29,6 +29,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.document_converter import PdfFormatOption
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
+    ThreadedPdfPipelineOptions,
     TesseractOcrOptions,
     AcceleratorOptions,
 )
@@ -130,19 +131,47 @@ def generate_container_name(user_id: str, workspace_id: str) -> str:
 
 
 def get_db():
-    return psycopg2.connect(os.environ["DATABASE_URL"], cursor_factory=RealDictCursor)
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        # Build from individual fields (Azure-style)
+        host = os.environ["DB_HOST"]
+        port = os.environ.get("DB_PORT", "5432")
+        name = os.environ["DB_NAME"]
+        user = os.environ["DB_USER"]
+        password = os.environ["DB_PASSWORD"]
+        url = f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode=require"
+    return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
 
 def get_blob_service():
-    return BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
+    conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        # Build from individual fields
+        account = os.environ["AZURE_ACCOUNT_NAME"]
+        key = os.environ["AZURE_ACCOUNT_KEY"]
+        conn_str = (
+            f"DefaultEndpointsProtocol=https;"
+            f"AccountName={account};"
+            f"AccountKey={key};"
+            f"EndpointSuffix=core.windows.net"
+        )
+    return BlobServiceClient.from_connection_string(conn_str)
 
 
-def create_converter(use_gpu: bool = True):
-    """Create a Docling converter with OCR + table extraction enabled."""
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.do_table_structure = True
-    pipeline_options.ocr_options = TesseractOcrOptions()
+def create_converter(use_gpu: bool = True, ocr_batch: int = 64, layout_batch: int = 64, table_batch: int = 4):
+    """Create a Docling converter with OCR + table extraction enabled.
+
+    Uses ThreadedPdfPipelineOptions to batch pages for GPU inference,
+    significantly improving throughput on multi-page documents.
+    """
+    pipeline_options = ThreadedPdfPipelineOptions(
+        do_ocr=True,
+        do_table_structure=True,
+        ocr_options=TesseractOcrOptions(),
+        ocr_batch_size=ocr_batch,
+        layout_batch_size=layout_batch,
+        table_batch_size=table_batch,
+    )
     pipeline_options.accelerator_options = AcceleratorOptions(
         num_threads=4,
         device="cuda" if use_gpu else "cpu",
@@ -251,6 +280,21 @@ def parse_args(argv=None):
         help="Enable/disable GPU acceleration (default: $USE_GPU or true)",
     )
     parser.add_argument(
+        "--ocr-batch", type=int,
+        default=int(os.environ.get("OCR_BATCH_SIZE", "64")),
+        help="Pages per OCR inference batch (default: $OCR_BATCH_SIZE or 64). Lower for <16GB VRAM.",
+    )
+    parser.add_argument(
+        "--layout-batch", type=int,
+        default=int(os.environ.get("LAYOUT_BATCH_SIZE", "64")),
+        help="Pages per layout detection batch (default: $LAYOUT_BATCH_SIZE or 64). Lower for <16GB VRAM.",
+    )
+    parser.add_argument(
+        "--table-batch", type=int,
+        default=int(os.environ.get("TABLE_BATCH_SIZE", "4")),
+        help="Tables per structure inference batch (default: $TABLE_BATCH_SIZE or 4). Memory-intensive, keep low.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be processed, then exit without running",
     )
@@ -290,6 +334,7 @@ def run_pipeline(args):
     print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
     print(f"  Max pages:     {_bold(str(max_pages) if max_pages > 0 else '0 (all pages)')}")
     print(f"  Workspace:     {_bold(workspace_id if workspace_id else '(all workspaces)')}")
+    print(f"  GPU batching:  {_dim(f'ocr={args.ocr_batch}  layout={args.layout_batch}  table={args.table_batch}')}")
     if args.dry_run:
         print(f"  Mode:          {_yellow('DRY RUN')}")
     print()
@@ -346,7 +391,12 @@ def run_pipeline(args):
 
     # ── Process ──
     blob_service = get_blob_service()
-    converter = create_converter(use_gpu=use_gpu)
+    converter = create_converter(
+        use_gpu=use_gpu,
+        ocr_batch=args.ocr_batch,
+        layout_batch=args.layout_batch,
+        table_batch=args.table_batch,
+    )
 
     page_numbers_json = json.dumps(list(range(1, max_pages + 1))) if max_pages > 0 else '["all"]'
 
