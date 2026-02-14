@@ -93,7 +93,7 @@ FETCH_PENDING = """
     FROM files f
     JOIN folders fo ON fo.id = f.folder_id
     LEFT JOIN file_extractions fe
-        ON fe.file_id = f.id {strategy_join}
+        ON fe.file_id = f.id
     WHERE (fe.id IS NULL OR fe.status = %s)
       {workspace_filter}
     ORDER BY f.created_at ASC
@@ -374,12 +374,6 @@ def run_pipeline(args):
     # ── Build query ──
     query_params = [source_status]
 
-    if strategy:
-        strategy_join = "AND fe.strategy_name = %s"
-        query_params.append(strategy)
-    else:
-        strategy_join = ""
-
     if workspace_id:
         workspace_filter = "AND fo.workspace_id = %s"
         query_params.append(workspace_id)
@@ -389,7 +383,6 @@ def run_pipeline(args):
     query_params.append(batch_size)
 
     query = FETCH_PENDING.format(
-        strategy_join=strategy_join,
         workspace_filter=workspace_filter,
     )
 
