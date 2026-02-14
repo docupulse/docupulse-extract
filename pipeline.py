@@ -245,7 +245,8 @@ def extract_text_lite(file_path: str, max_pages: int = 0):
 
     page_texts = []
     for i in range(pages_to_read):
-        page_texts.append(reader.pages[i].extract_text() or "")
+        raw = reader.pages[i].extract_text() or ""
+        page_texts.append(raw.replace("\x00", ""))
 
     text = "\n\n".join(page_texts)
     pages = []
