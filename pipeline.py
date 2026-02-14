@@ -347,9 +347,11 @@ def run_pipeline(args):
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    # Silence noisy Azure/urllib3 HTTP logging
+    # Silence noisy third-party logging
     logging.getLogger("azure").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("docling").setLevel(logging.WARNING)
+    logging.getLogger("openpyxl").setLevel(logging.WARNING)
     log = logging.getLogger("docling-pipeline")
 
     strategy = args.strategy
