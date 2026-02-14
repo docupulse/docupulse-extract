@@ -407,6 +407,7 @@ def run_pipeline(args):
     workspace_id = args.workspace or None
     source_status = args.source_status
     completion_status = args.completion_status
+    file_types = [ft.strip() for ft in args.file_types.split(",")]
 
     # ── Banner ──
     accel_label = _green("GPU (CUDA)") if use_gpu else _yellow("CPU")
@@ -440,7 +441,6 @@ def run_pipeline(args):
     conn = get_db()
 
     # ── Build query ──
-    file_types = [ft.strip() for ft in args.file_types.split(",")]
     query_params = [source_status, file_types]
 
     if workspace_id:
