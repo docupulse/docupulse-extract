@@ -273,6 +273,11 @@ def parse_args(argv=None):
         help="Max files per run (default: $BATCH_SIZE or 50)",
     )
     parser.add_argument(
+        "--max-file-size", type=int,
+        default=int(os.environ.get("MAX_FILE_SIZE_MB", "50")),
+        help="Skip files larger than this (MB). Default: $MAX_FILE_SIZE_MB or 50",
+    )
+    parser.add_argument(
         "--strategy", "-s", type=str,
         default=os.environ.get("STRATEGY_NAME", "docling"),
         help='Strategy name filter (default: $STRATEGY_NAME or "docling"). '
@@ -375,6 +380,7 @@ def run_pipeline(args):
     print(f"  Batch size:    {_bold(str(batch_size))}")
     print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
     print(f"  Max pages:     {_bold(str(max_pages) if max_pages > 0 else '0 (all pages)')}")
+    print(f"  Max file size: {_bold(str(args.max_file_size) + 'MB')}")
     print(f"  Source status:  {_bold(source_status)}")
     print(f"  Target status:  {_bold(completion_status)}")
     print(f"  Workspace:     {_bold(workspace_id if workspace_id else '(all workspaces)')}")
@@ -499,6 +505,13 @@ def run_pipeline(args):
                 download_blob(blob_service, container_name, blob_name, str(local_file))
                 file_size = local_file.stat().st_size
                 log.info(f"{prefix} Downloaded {file_size:,} bytes")
+
+                # Skip oversized files
+                max_bytes = args.max_file_size * 1024 * 1024
+                if file_size > max_bytes:
+                    print(f"  {prefix} {_yellow('SKIPPED')} — {file_size:,} bytes exceeds {args.max_file_size}MB limit")
+                    skipped.append(file_id)
+                    continue
 
                 # Trim PDF if max_pages is set
                 convert_path = str(local_file)
