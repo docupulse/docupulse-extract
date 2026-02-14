@@ -3,3 +3,4 @@ azure-storage-blob>=12.19.0
 psycopg2-binary>=2.9.9
 pypdf>=4.0.0
 python-dotenv>=1.0.0
+easyocr>=1.7.0

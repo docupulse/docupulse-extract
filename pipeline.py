@@ -33,7 +33,7 @@ from docling.document_converter import PdfFormatOption
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
     ThreadedPdfPipelineOptions,
-    TesseractOcrOptions,
+    EasyOcrOptions,
     AcceleratorOptions,
 )
 
@@ -170,7 +170,7 @@ def create_converter(use_gpu: bool = True, ocr_batch: int = 64, layout_batch: in
     pipeline_options = ThreadedPdfPipelineOptions(
         do_ocr=True,
         do_table_structure=True,
-        ocr_options=TesseractOcrOptions(),
+        ocr_options=EasyOcrOptions(),
         ocr_batch_size=ocr_batch,
         layout_batch_size=layout_batch,
         table_batch_size=table_batch,
