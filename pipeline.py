@@ -347,6 +347,9 @@ def run_pipeline(args):
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    # Silence noisy Azure/urllib3 HTTP logging
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
     log = logging.getLogger("docling-pipeline")
 
     strategy = args.strategy
