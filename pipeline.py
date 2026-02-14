@@ -95,6 +95,7 @@ FETCH_PENDING = """
     LEFT JOIN file_extractions fe
         ON fe.file_id = f.id
     WHERE f.status = %s
+      AND f.filetype = ANY(%s)
       {workspace_filter}
     ORDER BY f.created_at ASC
     LIMIT %s;
@@ -309,6 +310,12 @@ def parse_args(argv=None):
         default=int(os.environ.get("MAX_FILE_SIZE_MB", "50")),
         help="Skip files larger than this (MB). Default: $MAX_FILE_SIZE_MB or 50",
     )
+    default_filetypes = os.environ.get("FILE_TYPES", "pdf,docx,doc,pptx,xlsx,xls,html,htm,png,jpg,jpeg,tiff,tif")
+    parser.add_argument(
+        "--file-types", type=str,
+        default=default_filetypes,
+        help='Comma-separated list of file types to process (default: $FILE_TYPES or common document types)',
+    )
     parser.add_argument(
         "--strategy", "-s", type=str,
         default=os.environ.get("STRATEGY_NAME", "docling"),
@@ -385,10 +392,12 @@ def run_pipeline(args):
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     # Silence noisy third-party logging
-    logging.getLogger("azure").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("docling").setLevel(logging.WARNING)
-    logging.getLogger("openpyxl").setLevel(logging.WARNING)
+    import warnings
+    warnings.filterwarnings("ignore", module="openpyxl")
+    logging.getLogger("azure").setLevel(logging.ERROR)
+    logging.getLogger("urllib3").setLevel(logging.ERROR)
+    logging.getLogger("docling").setLevel(logging.ERROR)
+    logging.getLogger("openpyxl").setLevel(logging.ERROR)
     log = logging.getLogger("docling-pipeline")
 
     strategy = args.strategy
@@ -413,6 +422,7 @@ def run_pipeline(args):
     print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
     print(f"  Max pages:     {_bold(str(max_pages) if max_pages > 0 else '0 (all pages)')}")
     print(f"  Max file size: {_bold(str(args.max_file_size) + 'MB')}")
+    print(f"  File types:    {_bold(', '.join(file_types))}")
     print(f"  Source status:  {_bold(source_status)}")
     print(f"  Target status:  {_bold(completion_status)}")
     print(f"  Workspace:     {_bold(workspace_id if workspace_id else '(all workspaces)')}")
@@ -430,7 +440,8 @@ def run_pipeline(args):
     conn = get_db()
 
     # ── Build query ──
-    query_params = [source_status]
+    file_types = [ft.strip() for ft in args.file_types.split(",")]
+    query_params = [source_status, file_types]
 
     if workspace_id:
         workspace_filter = "AND fo.workspace_id = %s"
@@ -504,6 +515,15 @@ def run_pipeline(args):
 
             prefix = f"[{idx}/{len(jobs)}]"
             file_start = time.monotonic()
+            file_ext = Path(blob_name).suffix.lower()
+
+            # Skip unsupported file types before downloading
+            supported_exts = {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm",
+                              ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
+            if file_ext not in supported_exts:
+                print(f"  {prefix} {_yellow('SKIPPED')} — unsupported format: {file_ext or '(none)'}")
+                skipped.append(file_id)
+                continue
 
             # If no user found for workspace, skip
             if not user_id:
@@ -528,7 +548,7 @@ def run_pipeline(args):
                 log.info(f"{prefix} Created extraction record {extraction_id}")
 
             container_name = generate_container_name(user_id, workspace_id_job)
-            file_ext = Path(blob_name).suffix or ".pdf"
+            file_ext = file_ext or ".pdf"
             local_file = Path(tmpdir) / f"{file_id}{file_ext}"
 
             try:
