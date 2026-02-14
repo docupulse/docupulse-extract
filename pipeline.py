@@ -616,6 +616,10 @@ def run_pipeline(args):
 
                 actual_page_numbers = list(range(1, max_pages + 1)) if max_pages > 0 else ["all"]
 
+                # Strip null bytes — PostgreSQL rejects \u0000 in JSON/text
+                text = text.replace("\x00", "")
+                markdown = markdown.replace("\x00", "")
+
                 raw_data = {
                     "pages": pages,
                     "content_markdown": markdown,
@@ -653,6 +657,7 @@ def run_pipeline(args):
                 print(f"  {prefix} {_green('Done')} — {len(markdown):,} chars, {num_pages_found} pages, {num_tables} tables ({format_duration(elapsed)})")
 
             except Exception as e:
+                conn.rollback()
                 elapsed = time.monotonic() - file_start
                 print(f"  {prefix} {_red('FAILED')} — {e}")
                 try:
