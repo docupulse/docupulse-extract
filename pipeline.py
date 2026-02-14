@@ -234,6 +234,38 @@ def trim_pdf_pages(input_path: str, max_pages: int) -> str:
     return trimmed_path
 
 
+def extract_text_lite(file_path: str, max_pages: int = 0):
+    """Fast text extraction using pypdf — no GPU, no layout analysis, instant."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(file_path)
+    total_pages = len(reader.pages)
+    pages_to_read = min(max_pages, total_pages) if max_pages > 0 else total_pages
+
+    page_texts = []
+    for i in range(pages_to_read):
+        page_texts.append(reader.pages[i].extract_text() or "")
+
+    text = "\n\n".join(page_texts)
+    pages = []
+    for i, page_text in enumerate(page_texts, start=1):
+        lines = [
+            {"content": line, "polygon": None}
+            for line in page_text.split("\n")
+            if line.strip()
+        ]
+        if lines:
+            pages.append({"page_number": i, "lines": lines})
+
+    return {
+        "text": text,
+        "markdown": text,  # plain text as markdown in lite mode
+        "pages": pages,
+        "num_pages": pages_to_read,
+        "num_tables": 0,
+    }
+
+
 def format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
@@ -513,45 +545,54 @@ def run_pipeline(args):
                 print(f"  {prefix} {_cyan('Downloading')} {container_name}/{blob_name} ({blob_size:,} bytes)...")
                 download_blob(blob_service, container_name, blob_name, str(local_file))
 
-                # Trim PDF if max_pages is set
-                convert_path = str(local_file)
-                if max_pages > 0 and file_ext.lower() == ".pdf":
-                    log.info(f"{prefix} Trimming PDF to first {max_pages} page(s)...")
-                    convert_path = trim_pdf_pages(str(local_file), max_pages)
+                # Extract content
+                if args.lite and file_ext.lower() == ".pdf":
+                    # Fast text extraction via pypdf — no GPU needed
+                    print(f"  {prefix} {_cyan('Extracting')} text (lite)...")
+                    lite_result = extract_text_lite(str(local_file), max_pages)
+                    text = lite_result["text"]
+                    markdown = lite_result["markdown"]
+                    pages = lite_result["pages"]
+                    num_pages_found = lite_result["num_pages"]
+                    num_tables = 0
+                else:
+                    # Full Docling extraction
+                    convert_path = str(local_file)
+                    if max_pages > 0 and file_ext.lower() == ".pdf":
+                        log.info(f"{prefix} Trimming PDF to first {max_pages} page(s)...")
+                        convert_path = trim_pdf_pages(str(local_file), max_pages)
 
-                # Convert with Docling
-                print(f"  {prefix} {_cyan('Processing')} with Docling...")
-                result = converter.convert(convert_path)
+                    print(f"  {prefix} {_cyan('Processing')} with Docling...")
+                    result = converter.convert(convert_path)
 
-                markdown = result.document.export_to_markdown()
-                text = (
-                    result.document.export_to_text()
-                    if hasattr(result.document, "export_to_text")
-                    else ""
-                )
+                    markdown = result.document.export_to_markdown()
+                    text = (
+                        result.document.export_to_text()
+                        if hasattr(result.document, "export_to_text")
+                        else ""
+                    )
+                    num_pages_found = (
+                        len(result.document.pages)
+                        if hasattr(result.document, "pages")
+                        else None
+                    )
+                    num_tables = (
+                        len(result.document.tables)
+                        if hasattr(result.document, "tables")
+                        else 0
+                    )
 
-                num_pages_found = (
-                    len(result.document.pages)
-                    if hasattr(result.document, "pages")
-                    else None
-                )
-                num_tables = (
-                    len(result.document.tables)
-                    if hasattr(result.document, "tables")
-                    else 0
-                )
-
-                # Build page-level lines for compatibility with existing chunking
-                pages = []
-                if text:
-                    for i, page_text in enumerate(_split_by_pages(text, num_pages_found), start=1):
-                        lines = [
-                            {"content": line, "polygon": None}
-                            for line in page_text.split("\n")
-                            if line.strip()
-                        ]
-                        if lines:
-                            pages.append({"page_number": i, "lines": lines})
+                    # Build page-level lines for compatibility with existing chunking
+                    pages = []
+                    if text:
+                        for i, page_text in enumerate(_split_by_pages(text, num_pages_found), start=1):
+                            lines = [
+                                {"content": line, "polygon": None}
+                                for line in page_text.split("\n")
+                                if line.strip()
+                            ]
+                            if lines:
+                                pages.append({"page_number": i, "lines": lines})
 
                 actual_page_numbers = list(range(1, max_pages + 1)) if max_pages > 0 else ["all"]
 
@@ -568,9 +609,9 @@ def run_pipeline(args):
 
                 metadata = {
                     "extraction_model": strategy or "docling",
-                    "processing_method": "docling_gpu" if use_gpu else "docling_cpu",
-                    "ocr_used": True,
-                    "gpu_accelerated": use_gpu,
+                    "processing_method": "pypdf_lite" if args.lite else ("docling_gpu" if use_gpu else "docling_cpu"),
+                    "ocr_used": not args.lite,
+                    "gpu_accelerated": use_gpu and not args.lite,
                     "content_length": len(markdown),
                     "num_pages": num_pages_found,
                     "num_tables": num_tables,
