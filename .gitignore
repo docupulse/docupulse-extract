@@ -1,0 +1,4 @@
+.claude
+.env
+*.log
+.vscode
