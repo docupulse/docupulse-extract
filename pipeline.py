@@ -587,7 +587,7 @@ def run_pipeline(args):
                         ))
                     conn.commit()
                 except Exception:
-                    log.error(f"{prefix} Could not mark as failed in DB", exc_info=True)
+                    log.warning(f"{prefix} Could not mark as failed in DB")
                 failed.append(file_id)
             finally:
                 # Clean up downloaded file to save disk on large batches
