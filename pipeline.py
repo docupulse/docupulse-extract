@@ -21,6 +21,9 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from azure.storage.blob import BlobServiceClient
