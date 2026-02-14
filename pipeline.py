@@ -500,18 +500,18 @@ def run_pipeline(args):
             local_file = Path(tmpdir) / f"{file_id}{file_ext}"
 
             try:
-                # Download
-                print(f"  {prefix} {_cyan('Downloading')} {container_name}/{blob_name}...")
-                download_blob(blob_service, container_name, blob_name, str(local_file))
-                file_size = local_file.stat().st_size
-                log.info(f"{prefix} Downloaded {file_size:,} bytes")
-
-                # Skip oversized files
+                # Check blob size before downloading
                 max_bytes = args.max_file_size * 1024 * 1024
-                if file_size > max_bytes:
-                    print(f"  {prefix} {_yellow('SKIPPED')} — {file_size:,} bytes exceeds {args.max_file_size}MB limit")
+                blob_client = blob_service.get_container_client(container_name).get_blob_client(blob_name)
+                blob_size = blob_client.get_blob_properties().size
+                if blob_size > max_bytes:
+                    print(f"  {prefix} {_yellow('SKIPPED')} — {blob_size:,} bytes exceeds {args.max_file_size}MB limit")
                     skipped.append(file_id)
                     continue
+
+                # Download
+                print(f"  {prefix} {_cyan('Downloading')} {container_name}/{blob_name} ({blob_size:,} bytes)...")
+                download_blob(blob_service, container_name, blob_name, str(local_file))
 
                 # Trim PDF if max_pages is set
                 convert_path = str(local_file)
