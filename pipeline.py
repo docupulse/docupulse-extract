@@ -168,20 +168,26 @@ def get_blob_service():
     return BlobServiceClient.from_connection_string(conn_str)
 
 
-def create_converter(use_gpu: bool = True, ocr_batch: int = 64, layout_batch: int = 64, table_batch: int = 4):
-    """Create a Docling converter with OCR + table extraction enabled.
+def create_converter(use_gpu: bool = True, ocr_batch: int = 64, layout_batch: int = 64, table_batch: int = 4, lite: bool = False):
+    """Create a Docling converter.
 
-    Uses ThreadedPdfPipelineOptions to batch pages for GPU inference,
-    significantly improving throughput on multi-page documents.
+    lite=False (default): full pipeline — OCR, table structure, layout analysis
+    lite=True:            fast text-only extraction — no OCR, no table structure
     """
-    pipeline_options = ThreadedPdfPipelineOptions(
-        do_ocr=True,
-        do_table_structure=True,
-        ocr_options=EasyOcrOptions(),
-        ocr_batch_size=ocr_batch,
-        layout_batch_size=layout_batch,
-        table_batch_size=table_batch,
-    )
+    if lite:
+        pipeline_options = PdfPipelineOptions(
+            do_ocr=False,
+            do_table_structure=False,
+        )
+    else:
+        pipeline_options = ThreadedPdfPipelineOptions(
+            do_ocr=True,
+            do_table_structure=True,
+            ocr_options=EasyOcrOptions(),
+            ocr_batch_size=ocr_batch,
+            layout_batch_size=layout_batch,
+            table_batch_size=table_batch,
+        )
     pipeline_options.accelerator_options = AcceleratorOptions(
         num_threads=4,
         device="cuda" if use_gpu else "cpu",
@@ -314,6 +320,13 @@ def parse_args(argv=None):
         default=int(os.environ.get("TABLE_BATCH_SIZE", "4")),
         help="Tables per structure inference batch (default: $TABLE_BATCH_SIZE or 4). Memory-intensive, keep low.",
     )
+    lite_default = os.environ.get("LITE_MODE", "false").lower() in ("true", "1", "yes")
+    parser.add_argument(
+        "--lite", dest="lite",
+        action=argparse.BooleanOptionalAction,
+        default=lite_default,
+        help="Fast text-only extraction — skip OCR, table structure, and heavy layout analysis (default: $LITE_MODE or false)",
+    )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be processed, then exit without running",
@@ -351,6 +364,8 @@ def run_pipeline(args):
     print(_bold(f"  DocuPulse Docling Pipeline  v{__version__}"))
     print(_bold("=" * 58))
     print()
+    mode_label = _yellow("LITE (text-only)") if args.lite else _green("FULL (OCR + tables + layout)")
+    print(f"  Mode:          {mode_label}")
     print(f"  Accelerator:   {accel_label}")
     print(f"  Batch size:    {_bold(str(batch_size))}")
     print(f"  Strategy:      {_bold(strategy if strategy else '(all — no filter)')}")
@@ -419,6 +434,7 @@ def run_pipeline(args):
         ocr_batch=args.ocr_batch,
         layout_batch=args.layout_batch,
         table_batch=args.table_batch,
+        lite=args.lite,
     )
 
     page_numbers_json = json.dumps(list(range(1, max_pages + 1))) if max_pages > 0 else '["all"]'
